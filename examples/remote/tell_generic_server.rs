@@ -3,6 +3,8 @@
 //! Run this first:
 //! cargo run --example tell_generic_server --features remote
 
+#![allow(dead_code, unused_variables)]
+
 use kameo::actor::{Actor, ActorRef};
 use kameo::distributed_actor;
 use kameo::message::{Context, Message};
@@ -169,12 +171,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let storage_ref = StorageActor::spawn(());
     let storage_id = storage_ref.id();
 
+    // Register with transport - automatically handles distributed ask/reply
     transport
-        .register_actor("storage".to_string(), storage_id)
+        .register_distributed_actor("storage".to_string(), &storage_ref)
         .await?;
-
-    let handler = kameo::remote::v2_bootstrap::get_distributed_handler();
-    handler.registry().register(storage_id, storage_ref.clone());
 
     println!("✅ StorageActor registered with ID {:?}", storage_id);
 

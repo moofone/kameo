@@ -5,7 +5,7 @@
 //! and write directly to the socket for minimal latency.
 //!
 //! # Example
-//! ```
+//! ```ignore
 //! // Create a stream for sending PreBacktest messages
 //! let mut stream = actor_ref.create_stream::<PreBacktest>("backtest_data").await?;
 //!
@@ -275,7 +275,7 @@ where
     ) -> Result<(), StreamError> {
         const MAX_CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks (matching kameo_remote)
 
-        let total_chunks = (data.len() + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
+        let total_chunks = data.len().div_ceil(MAX_CHUNK_SIZE);
 
         // Send StreamStart first
         let start_header = kameo_remote::StreamHeader {
@@ -494,7 +494,7 @@ where
 
         Err(format!(
             "Stream {} ({}) forcibly cleaned up - chunks: {}/{:?}, memory: {} bytes, age: {:?}, inactive: {:?}",
-            info.stream_id, info.name, info.chunks_received, info.expected_chunks, 
+            info.stream_id, info.name, info.chunks_received, info.expected_chunks,
             info.memory_usage, info.age, info.last_activity
         ).into())
     }

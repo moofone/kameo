@@ -25,18 +25,19 @@ impl KameoActorMessageHandler {
     }
 }
 
+/// Type alias for the actor message handler future return type
+type ActorMessageFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = kameo_remote::Result<Option<Vec<u8>>>> + Send>,
+>;
+
 /// Create an immediate error future for invalid actor IDs
 ///
 /// This helper simplifies error handling in the message handler by providing
 /// a clean way to return parse errors without nested async blocks.
-fn invalid_actor_id_error(
-    actor_id: &str,
-    err: std::num::ParseIntError,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = kameo_remote::Result<Option<Vec<u8>>>> + Send>>
-{
+fn invalid_actor_id_error(actor_id: &str, err: std::num::ParseIntError) -> ActorMessageFuture {
     let msg = format!("Invalid actor_id '{}': {}", actor_id, err);
     Box::pin(std::future::ready(Err(kameo_remote::GossipError::Network(
-        std::io::Error::new(std::io::ErrorKind::InvalidData, msg),
+        std::io::Error::other(msg),
     ))))
 }
 
@@ -72,7 +73,7 @@ impl kameo_remote::registry::ActorMessageHandler for KameoActorMessageHandler {
                     distributed_handler.as_ref(),
                     actor_id,
                     type_hash,
-                    payload.into(),
+                    payload,
                 )
                 .await
                 {
@@ -80,8 +81,7 @@ impl kameo_remote::registry::ActorMessageHandler for KameoActorMessageHandler {
                         // OPTIMIZATION: reply is already Bytes, convert to Vec without clone
                         Ok(Some(reply.into()))
                     }
-                    Err(e) => Err(kameo_remote::GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Err(e) => Err(kameo_remote::GossipError::Network(std::io::Error::other(
                         format!("Ask handler error: {:?}", e),
                     ))),
                 }
@@ -91,13 +91,12 @@ impl kameo_remote::registry::ActorMessageHandler for KameoActorMessageHandler {
                     distributed_handler.as_ref(),
                     actor_id,
                     type_hash,
-                    payload.into(),
+                    payload,
                 )
                 .await
                 {
                     Ok(()) => Ok(None),
-                    Err(e) => Err(kameo_remote::GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Err(e) => Err(kameo_remote::GossipError::Network(std::io::Error::other(
                         format!("Tell handler error: {:?}", e),
                     ))),
                 }
@@ -192,8 +191,8 @@ fn set_v2_transport_env_var() {
 /// use kameo::remote::v2_bootstrap;
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let keypair = kameo_remote::KeyPair::from_seed_for_testing(42);
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     let keypair = kameo_remote::KeyPair::new_for_testing("test");
 ///     let transport = v2_bootstrap::bootstrap_with_keypair(
 ///         "127.0.0.1:8080".parse()?,
 ///         keypair
@@ -241,7 +240,7 @@ pub async fn bootstrap_with_keypair(
     // Create and start the gossip registry with TLS enabled using new_with_tls
     let handle = GossipRegistryHandle::new_with_tls(addr, secret_key, Some(gossip_config))
         .await
-        .map_err(|e| BoxError::from(e))?;
+        .map_err(BoxError::from)?;
 
     // Use the set_handle method if available, or we need to add it
     transport.set_handle(Arc::new(handle));
@@ -296,7 +295,7 @@ pub async fn bootstrap_with_keypair(
 /// use kameo::remote::v2_bootstrap;
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///     let transport = v2_bootstrap::bootstrap_on("127.0.0.1:9330".parse()?).await?;
 ///     Ok(())
 /// }
@@ -313,16 +312,18 @@ pub async fn bootstrap_on(addr: SocketAddr) -> Result<Box<KameoTransport>, BoxEr
 ///
 /// # Example
 /// ```no_run
-/// use kameo::remote::{v2_bootstrap, TransportConfig};
+/// use kameo::remote::v2_bootstrap;
+/// use kameo::remote::transport::TransportConfig;
 /// use std::time::Duration;
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///     let config = TransportConfig {
 ///         bind_addr: "127.0.0.1:0".parse()?,
 ///         max_connections: 500,
 ///         connection_timeout: Duration::from_secs(10),
 ///         enable_encryption: false, // For testing
+///         peers: Vec::new(),
 ///     };
 ///     let transport = v2_bootstrap::bootstrap_with_config(config).await?;
 ///     Ok(())
@@ -394,7 +395,7 @@ pub async fn bootstrap_with_config(
 /// use kameo::remote::v2_bootstrap;
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///     // Create 3 isolated nodes on ports 8080, 8081, 8082
 ///     let transports = v2_bootstrap::bootstrap_cluster(3, 8080).await?;
 ///
