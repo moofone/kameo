@@ -5,8 +5,10 @@
 //! Each message type gets its own specialized code path for maximum performance.
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use bytes::BufMut;
 use rkyv::{Archive, Deserialize as RDeserialize, Serialize as RSerialize};
 
@@ -20,13 +22,13 @@ use kameo_remote::{GossipError, connection_pool::ConnectionHandle, registry::Reg
 
 /// A reference to a remote distributed actor
 ///
-/// This actor reference uses compile-time monomorphization
+/// This actor reference uses compile-time monomorphization. Each call to `.tell()` or `.ask()`
+/// is monomorphized by the message type, allowing the compiler to optimize away all runtime
+/// type checks and generate the most efficient code possible.
 ///
-/// Each call to `.tell()` or `.ask()` is monomorphized by the message type, allowing the compiler
-/// to optimize away all runtime type checks and generate the most efficient code possible.
-///
-/// This eliminates dynamic dispatch overhead
-#[derive(Debug)]
+/// Uses `ArcSwapOption` for lock-free atomic connection swapping.
+/// On connection failure, the connection can be refreshed and retried
+/// without blocking other concurrent operations.
 pub struct DistributedActorRef<A, T = Box<super::kameo_transport::KameoTransport>>
 where
     A: Actor,
@@ -37,10 +39,25 @@ where
     pub(crate) location: RemoteActorLocation,
     /// The transport to use for communication
     pub(crate) transport: T,
-    /// Cached connection handle for lock-free access (only for KameoTransport)
-    pub(crate) connection: Option<ConnectionHandle>,
+    /// Cached connection handle with lock-free atomic swapping for auto-refresh
+    pub(crate) connection: ArcSwapOption<ConnectionHandle>,
     /// The actor type, used for message type inference
     pub(crate) _actor_type: PhantomData<A>,
+}
+
+impl<A, T> std::fmt::Debug for DistributedActorRef<A, T>
+where
+    A: Actor,
+    T: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistributedActorRef")
+            .field("actor_id", &self.actor_id)
+            .field("location", &self.location)
+            .field("transport", &self.transport)
+            .field("connection", &self.connection.load_full().is_some())
+            .finish()
+    }
 }
 
 impl<A, T> Clone for DistributedActorRef<A, T>
@@ -49,11 +66,14 @@ where
     T: Clone,
 {
     fn clone(&self) -> Self {
+        // Clone creates a new ArcSwapOption with the current connection Arc
+        // Note: refreshes in one clone won't update other clones (this is intentional
+        // to avoid unexpected behavior for callers who expect independent refs)
         Self {
             actor_id: self.actor_id,
             location: self.location.clone(),
             transport: self.transport.clone(),
-            connection: self.connection.clone(),
+            connection: ArcSwapOption::new(self.connection.load_full()),
             _actor_type: PhantomData,
         }
     }
@@ -78,7 +98,7 @@ where
             actor_id,
             location,
             transport,
-            connection: Some(connection),
+            connection: ArcSwapOption::new(Some(Arc::new(connection))),
             _actor_type: PhantomData,
         }
     }
@@ -103,7 +123,7 @@ where
             actor_id,
             location,
             transport,
-            connection: None,
+            connection: ArcSwapOption::empty(),
             _actor_type: PhantomData,
         }
     }
@@ -203,7 +223,7 @@ where
 }
 
 // Global transport cache for lookup without parameters
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 
 /// Global transport instance for distributed actor lookups
 ///
@@ -248,6 +268,34 @@ where
         } else {
             Ok(None)
         }
+    }
+
+    /// Load the cached connection (lock-free)
+    fn load_connection(&self) -> Option<Arc<ConnectionHandle>> {
+        self.connection.load_full()
+    }
+
+    /// Refresh connection from transport and store atomically
+    ///
+    /// Returns the new connection on success, or error if connection fails.
+    async fn refresh_connection(&self) -> Result<Arc<ConnectionHandle>, SendError> {
+        let new_conn = self.transport
+            .get_connection_for_location(&self.location)
+            .await
+            .map_err(|_| SendError::ActorStopped)?;
+        let arc_conn = Arc::new(new_conn);
+        self.connection.store(Some(arc_conn.clone()));
+        Ok(arc_conn)
+    }
+
+    /// Check if an error is connection-related and should trigger a refresh
+    fn is_connection_error(err: &GossipError) -> bool {
+        matches!(
+            err,
+            GossipError::Network(_)
+                | GossipError::PeerNotFound(_)
+                | GossipError::Shutdown
+        )
     }
 }
 
@@ -311,8 +359,8 @@ where
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&self.message)
             .map_err(|_e| SendError::ActorStopped)?;
 
-        // Use streaming for large messages automatically
-        if let Some(ref conn) = self.actor_ref.connection {
+        // Load connection using lock-free atomic access
+        if let Some(conn) = self.actor_ref.connection.load_full() {
             // Get actual threshold from connection
             let threshold = conn.streaming_threshold();
 
@@ -354,6 +402,98 @@ where
         }
 
         Err(SendError::MissingConnection)
+    }
+}
+
+// Specialized implementation for KameoTransport with auto-retry on connection failure
+impl<'a, A, M> DistributedTellRequest<'a, A, M, Box<super::kameo_transport::KameoTransport>>
+where
+    A: Actor,
+    M: HasTypeHash
+        + Send
+        + 'static
+        + Archive
+        + for<'b> RSerialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'b>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >,
+{
+    /// Send with automatic connection refresh on failure.
+    ///
+    /// On connection error, this method will:
+    /// 1. Refresh the connection from the transport
+    /// 2. Retry the send once with the new connection
+    ///
+    /// This provides K8s resilience when pods restart with new IPs.
+    pub async fn send_with_retry(self) -> Result<(), SendError> {
+        // Pre-serialize the message once for potential retry
+        let type_hash = M::TYPE_HASH.as_u32();
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&self.message)
+            .map_err(|_e| SendError::ActorStopped)?;
+
+        // First attempt with cached connection
+        if let Some(conn) = self.actor_ref.load_connection() {
+            match self.try_send_payload(&conn, type_hash, &payload).await {
+                Ok(()) => return Ok(()),
+                Err(e) if DistributedActorRef::<A, Box<super::kameo_transport::KameoTransport>>::is_connection_error(&e) => {
+                    // Connection error - try to refresh and retry
+                    tracing::debug!("Connection error, attempting refresh and retry");
+                    if let Ok(new_conn) = self.actor_ref.refresh_connection().await {
+                        return self.try_send_payload(&new_conn, type_hash, &payload)
+                            .await
+                            .map_err(|_| SendError::ActorStopped);
+                    }
+                }
+                Err(_) => return Err(SendError::ActorStopped),
+            }
+        }
+
+        // No connection - try to establish one
+        match self.actor_ref.refresh_connection().await {
+            Ok(conn) => self.try_send_payload(&conn, type_hash, &payload)
+                .await
+                .map_err(|_| SendError::ActorStopped),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Internal helper to send pre-serialized payload
+    async fn try_send_payload(
+        &self,
+        conn: &ConnectionHandle,
+        type_hash: u32,
+        payload: &[u8],
+    ) -> Result<(), GossipError> {
+        let threshold = conn.streaming_threshold();
+
+        // Use streaming for large messages
+        if payload.len() > threshold {
+            return conn
+                .stream_large_message(payload, type_hash, self.actor_ref.actor_id.into_u64())
+                .await;
+        }
+
+        // Small message - use ring buffer
+        let inner_size = 12 + 16 + payload.len();
+        let mut message = bytes::BytesMut::with_capacity(4 + inner_size);
+
+        message.put_u32(inner_size as u32);
+        message.put_u8(3); // MessageType::ActorTell
+        message.put_u16(0); // No correlation for tell
+        message.put_slice(&[0u8; 9]);
+        message.put_u64(self.actor_ref.actor_id.into_u64());
+        message.put_u32(type_hash);
+        message.put_u32(payload.len() as u32);
+        message.put_slice(payload);
+
+        let message_bytes = message.freeze();
+        conn.send_bytes_zero_copy(message_bytes).await
     }
 }
 
@@ -451,7 +591,8 @@ where
         // Default timeout if not specified
         let default_timeout = Duration::from_secs(2);
 
-        if let Some(conn) = self.actor_ref.connection.as_ref() {
+        // Load connection using lock-free atomic access
+        if let Some(conn) = self.actor_ref.connection.load_full() {
             let threshold = conn.streaming_threshold();
             if payload.len() > threshold {
                 // For streaming, scale timeout based on payload size if not explicitly set.

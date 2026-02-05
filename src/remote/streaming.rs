@@ -640,12 +640,13 @@ impl<A: Actor> StreamFactory
                 >,
             >,
     {
-        if let Some(ref connection) = self.connection {
+        // Load connection using lock-free atomic access
+        if let Some(conn) = self.connection.load_full() {
             // Create a new stream - start message is sent when chunking begins
             Ok(MessageStream::new(
                 name.to_string(),
                 self.actor_id,
-                connection.clone(),
+                (*conn).clone(),
             ))
         } else {
             Err(StreamError::NotConnected)
