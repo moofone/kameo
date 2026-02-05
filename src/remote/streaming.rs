@@ -196,6 +196,9 @@ where
 
     /// Send raw bytes through the stream (for pre-serialized data)
     pub async fn send_raw(&mut self, type_hash: u32, data: &[u8]) -> Result<(), StreamError> {
+        if self.connection.is_shutdown() {
+            return Err(StreamError::ConnectionStale);
+        }
         self.write_frame(type_hash, data).await
     }
 
@@ -205,6 +208,9 @@ where
         type_hash: u32,
         data: bytes::Bytes,
     ) -> Result<(), StreamError> {
+        if self.connection.is_shutdown() {
+            return Err(StreamError::ConnectionStale);
+        }
         self.write_frame_owned(type_hash, data).await
     }
 
@@ -214,6 +220,9 @@ where
         type_hash: u32,
         aligned_vec: rkyv::util::AlignedVec,
     ) -> Result<(), StreamError> {
+        if self.connection.is_shutdown() {
+            return Err(StreamError::ConnectionStale);
+        }
         // Convert AlignedVec to Bytes with zero-copy transfer of ownership
         let data = bytes::Bytes::from(aligned_vec.into_vec());
         self.write_frame_owned(type_hash, data).await
@@ -223,6 +232,9 @@ where
     ///
     /// This sends a stream end marker to the receiver
     pub async fn close(self) -> Result<(), StreamError> {
+        if self.connection.is_shutdown() {
+            return Err(StreamError::ConnectionStale);
+        }
         // Create StreamHeader for end message
         let header = kameo_remote::StreamHeader {
             stream_id: self.stream_id,

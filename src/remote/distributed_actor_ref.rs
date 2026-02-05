@@ -767,14 +767,21 @@ where
         payload: &[u8],
         timeout: Duration,
     ) -> Result<bytes::Bytes, SendError> {
+        // Check if connection is shutdown before attempting send
+        if conn.is_shutdown() {
+            return Err(SendError::ConnectionShutdown);
+        }
+
         let threshold = conn.streaming_threshold();
 
         // Use streaming for large messages
         if payload.len() > threshold {
-            let streaming_timeout = {
+            // Use caller's timeout, with minimum based on payload size
+            let min_streaming_timeout = {
                 let payload_mb = payload.len() as u64 / (1024 * 1024);
                 Duration::from_secs(30 + payload_mb)
             };
+            let streaming_timeout = std::cmp::max(timeout, min_streaming_timeout);
 
             let reply = conn
                 .ask_streaming_bytes(
@@ -784,10 +791,7 @@ where
                     streaming_timeout,
                 )
                 .await
-                .map_err(|e| match e {
-                    GossipError::Timeout => SendError::Timeout(None),
-                    _ => SendError::ActorStopped,
-                })?;
+                .map_err(Self::map_gossip_error)?;
 
             return Ok(reply);
         }
@@ -805,15 +809,29 @@ where
 
         let reply = match tokio::time::timeout(timeout, conn.ask(&serialized_msg)).await {
             Ok(Ok(bytes)) => bytes,
-            Ok(Err(_)) => return Err(SendError::ActorStopped),
+            Ok(Err(e)) => return Err(Self::map_gossip_error(e)),
             Err(_) => return Err(SendError::Timeout(None)),
         };
 
         Ok(reply)
     }
 
+    /// Map GossipError to SendError, preserving connection-related errors for retry logic
+    fn map_gossip_error(err: GossipError) -> SendError {
+        match err {
+            GossipError::Timeout => SendError::Timeout(None),
+            GossipError::Network(_) => SendError::ConnectionShutdown,
+            GossipError::PeerNotFound(_) => SendError::ConnectionShutdown,
+            GossipError::Shutdown => SendError::ConnectionShutdown,
+            _ => SendError::ActorStopped,
+        }
+    }
+
     /// Check if an error is connection-related and should trigger a refresh
+    ///
+    /// Only returns true for errors that indicate the connection itself failed,
+    /// NOT for errors like ActorStopped which could mean the remote actor is dead.
     fn is_connection_error(err: &SendError) -> bool {
-        matches!(err, SendError::ActorStopped | SendError::MissingConnection)
+        matches!(err, SendError::ConnectionShutdown | SendError::MissingConnection)
     }
 }

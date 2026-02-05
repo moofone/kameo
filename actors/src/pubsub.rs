@@ -139,7 +139,8 @@ impl<M> PubSub<M> {
                 Ok(_) => {}
                 Err(SendError::ActorNotRunning(_))
                 | Err(SendError::ActorStopped)
-                | Err(SendError::MissingConnection) => {
+                | Err(SendError::MissingConnection)
+                | Err(SendError::ConnectionShutdown) => {
                     self.subscribers.remove(&id);
                 }
                 Err(SendError::MailboxFull(_))

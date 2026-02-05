@@ -92,6 +92,9 @@ pub enum SendError<M = (), E = Infallible> {
     ActorStopped,
     /// Missing cached connection for remote actor refs.
     MissingConnection,
+    /// The connection was shutdown (network failure, pod restart, etc).
+    /// This is a retryable error - the caller should refresh the connection.
+    ConnectionShutdown,
     /// The actors mailbox is full.
     MailboxFull(M),
     /// An error returned by the actor's message handler.
@@ -110,6 +113,7 @@ impl<M, E> SendError<M, E> {
             SendError::ActorNotRunning(msg) => SendError::ActorNotRunning(f(msg)),
             SendError::ActorStopped => SendError::ActorStopped,
             SendError::MissingConnection => SendError::MissingConnection,
+            SendError::ConnectionShutdown => SendError::ConnectionShutdown,
             SendError::MailboxFull(msg) => SendError::MailboxFull(f(msg)),
             SendError::HandlerError(err) => SendError::HandlerError(err),
             SendError::Timeout(msg) => SendError::Timeout(msg.map(f)),
@@ -125,6 +129,7 @@ impl<M, E> SendError<M, E> {
             SendError::ActorNotRunning(msg) => SendError::ActorNotRunning(msg),
             SendError::ActorStopped => SendError::ActorStopped,
             SendError::MissingConnection => SendError::MissingConnection,
+            SendError::ConnectionShutdown => SendError::ConnectionShutdown,
             SendError::MailboxFull(msg) => SendError::MailboxFull(msg),
             SendError::HandlerError(err) => SendError::HandlerError(op(err)),
             SendError::Timeout(msg) => SendError::Timeout(msg),
@@ -141,6 +146,7 @@ impl<M, E> SendError<M, E> {
             SendError::ActorNotRunning(err) => SendError::ActorNotRunning(Box::new(err)),
             SendError::ActorStopped => SendError::ActorStopped,
             SendError::MissingConnection => SendError::MissingConnection,
+            SendError::ConnectionShutdown => SendError::ConnectionShutdown,
             SendError::MailboxFull(msg) => SendError::MailboxFull(Box::new(msg)),
             SendError::HandlerError(err) => SendError::HandlerError(Box::new(err)),
             SendError::Timeout(msg) => {
@@ -209,6 +215,10 @@ impl<M, E> SendError<M, SendError<M, E>> {
             }
             SendError::MissingConnection
             | SendError::HandlerError(SendError::MissingConnection) => SendError::MissingConnection,
+            SendError::ConnectionShutdown
+            | SendError::HandlerError(SendError::ConnectionShutdown) => {
+                SendError::ConnectionShutdown
+            }
             SendError::MailboxFull(msg) | SendError::HandlerError(SendError::MailboxFull(msg)) => {
                 SendError::MailboxFull(msg)
             }
@@ -242,6 +252,7 @@ impl BoxSendError {
             )),
             SendError::ActorStopped => Ok(SendError::ActorStopped),
             SendError::MissingConnection => Ok(SendError::MissingConnection),
+            SendError::ConnectionShutdown => Ok(SendError::ConnectionShutdown),
             SendError::MailboxFull(err) => Ok(SendError::MailboxFull(
                 *err.downcast().map_err(SendError::MailboxFull)?,
             )),
@@ -269,6 +280,7 @@ where
             SendError::ActorNotRunning(_) => write!(f, "ActorNotRunning"),
             SendError::ActorStopped => write!(f, "ActorStopped"),
             SendError::MissingConnection => write!(f, "MissingConnection"),
+            SendError::ConnectionShutdown => write!(f, "ConnectionShutdown"),
             SendError::MailboxFull(_) => write!(f, "MailboxFull"),
             SendError::HandlerError(err) => err.fmt(f),
             SendError::Timeout(_) => write!(f, "Timeout"),
@@ -285,6 +297,7 @@ where
             SendError::ActorNotRunning(_) => write!(f, "actor not running"),
             SendError::ActorStopped => write!(f, "actor stopped"),
             SendError::MissingConnection => write!(f, "missing cached connection"),
+            SendError::ConnectionShutdown => write!(f, "connection shutdown"),
             SendError::MailboxFull(_) => write!(f, "mailbox full"),
             SendError::HandlerError(err) => err.fmt(f),
             SendError::Timeout(_) => write!(f, "timeout"),
@@ -863,6 +876,7 @@ impl<M, E> From<SendError<M, E>> for RemoteSendError<E> {
             SendError::ActorNotRunning(_) => RemoteSendError::ActorNotRunning,
             SendError::ActorStopped => RemoteSendError::ActorStopped,
             SendError::MissingConnection => RemoteSendError::MissingConnection,
+            SendError::ConnectionShutdown => RemoteSendError::ConnectionClosed,
             SendError::MailboxFull(_) => RemoteSendError::MailboxFull,
             SendError::HandlerError(err) => RemoteSendError::HandlerError(err),
             SendError::Timeout(_) => RemoteSendError::ReplyTimeout,
