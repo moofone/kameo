@@ -1,6 +1,5 @@
 //! Minimal test server that demonstrates distributed actor registration/lookup issue
 
-use kameo::actor::Spawn;
 use kameo::actor::{Actor, ActorRef};
 use kameo::distributed_actor;
 use kameo::remote::transport::RemoteTransport;

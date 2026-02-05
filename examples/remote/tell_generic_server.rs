@@ -4,7 +4,6 @@
 //! cargo run --example tell_generic_server --features remote
 
 use kameo::RemoteMessage;
-use kameo::actor::Spawn;
 use kameo::actor::{Actor, ActorRef};
 use kameo::distributed_actor;
 use kameo::message::{Context, Message};

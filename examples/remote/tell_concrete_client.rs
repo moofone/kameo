@@ -6,7 +6,6 @@
 //! Run after starting the server:
 //! cargo run --example tell_concrete_client --features remote
 
-use kameo::actor::Spawn;
 use kameo::actor::{Actor, ActorRef};
 use kameo::distributed_actor;
 use kameo::remote::{DynamicDistributedActorRef, transport::RemoteTransport};

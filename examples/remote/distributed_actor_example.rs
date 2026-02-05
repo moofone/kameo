@@ -6,7 +6,7 @@
 //! 3. distributed_actor! macro for registering handlers
 
 use kameo::RemoteMessage;
-use kameo::actor::Spawn;
+
 use kameo::actor::{Actor, ActorRef};
 use kameo::distributed_actor;
 use kameo::message::{Context, Message};
