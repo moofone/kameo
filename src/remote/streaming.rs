@@ -83,6 +83,13 @@ pub enum StreamError {
     /// Received invalid or corrupted frame data
     #[error("invalid frame")]
     InvalidFrame,
+    /// Connection was refreshed - stream is stale and must be recreated
+    ///
+    /// Streams are connection-scoped to maintain protocol state. When the underlying
+    /// connection is refreshed (e.g., after pod restart), the stream becomes stale.
+    /// Callers should create a new stream after this error.
+    #[error("connection stale - create a new stream after connection refresh")]
+    ConnectionStale,
 }
 
 impl<M, E> From<StreamError> for CoreSendError<M, E> {
@@ -93,6 +100,7 @@ impl<M, E> From<StreamError> for CoreSendError<M, E> {
             StreamError::NotConnected => CoreSendError::ActorStopped,
             StreamError::StreamClosed => CoreSendError::ActorStopped,
             StreamError::InvalidFrame => CoreSendError::ActorStopped,
+            StreamError::ConnectionStale => CoreSendError::ActorStopped,
         }
     }
 }
@@ -160,7 +168,21 @@ where
     ///
     /// This method serializes the message and writes it directly to the socket
     /// with proper framing. Large messages are automatically chunked.
+    ///
+    /// # Connection Staleness
+    ///
+    /// Returns `StreamError::ConnectionStale` if the underlying connection was
+    /// shut down (e.g., after a network failure or pod restart). In this case,
+    /// callers should refresh the parent actor ref's connection and create a
+    /// new stream.
     pub async fn send(&mut self, message: M) -> Result<(), StreamError> {
+        // Check if our connection is shutdown (fail-fast)
+        // This detects when the connection was closed due to network failure
+        // Part A of the plan makes writer failures detectable via is_shutdown()
+        if self.connection.is_shutdown() {
+            return Err(StreamError::ConnectionStale);
+        }
+
         // Get compile-time type hash
         let type_hash = M::TYPE_HASH.as_u32();
 

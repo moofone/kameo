@@ -26,9 +26,10 @@ use kameo_remote::{GossipError, connection_pool::ConnectionHandle, registry::Reg
 /// is monomorphized by the message type, allowing the compiler to optimize away all runtime
 /// type checks and generate the most efficient code possible.
 ///
-/// Uses `ArcSwapOption` for lock-free atomic connection swapping.
-/// On connection failure, the connection can be refreshed and retried
-/// without blocking other concurrent operations.
+/// Uses `Arc<ArcSwapOption>` for lock-free atomic connection swapping that is shared
+/// across all clones. When one clone refreshes the connection (e.g., after a network
+/// failure), ALL clones automatically see the new connection. This provides K8s
+/// resilience without requiring callers to manage connection state manually.
 pub struct DistributedActorRef<A, T = Box<super::kameo_transport::KameoTransport>>
 where
     A: Actor,
@@ -39,8 +40,10 @@ where
     pub(crate) location: RemoteActorLocation,
     /// The transport to use for communication
     pub(crate) transport: T,
-    /// Cached connection handle with lock-free atomic swapping for auto-refresh
-    pub(crate) connection: ArcSwapOption<ConnectionHandle>,
+    /// Cached connection handle with lock-free atomic swapping for auto-refresh.
+    /// Arc-wrapped so that clones share the same connection state - when one clone
+    /// refreshes the connection, all clones see the new connection.
+    pub(crate) connection: Arc<ArcSwapOption<ConnectionHandle>>,
     /// The actor type, used for message type inference
     pub(crate) _actor_type: PhantomData<A>,
 }
@@ -66,14 +69,15 @@ where
     T: Clone,
 {
     fn clone(&self) -> Self {
-        // Clone creates a new ArcSwapOption with the current connection Arc
-        // Note: refreshes in one clone won't update other clones (this is intentional
-        // to avoid unexpected behavior for callers who expect independent refs)
+        // Clone shares the same Arc<ArcSwapOption> so that all clones see connection
+        // refreshes. This is important for K8s resilience: when one clone detects a
+        // connection failure and refreshes, all other clones automatically use the
+        // new connection.
         Self {
             actor_id: self.actor_id,
             location: self.location.clone(),
             transport: self.transport.clone(),
-            connection: ArcSwapOption::new(self.connection.load_full()),
+            connection: Arc::clone(&self.connection),
             _actor_type: PhantomData,
         }
     }
@@ -98,7 +102,7 @@ where
             actor_id,
             location,
             transport,
-            connection: ArcSwapOption::new(Some(Arc::new(connection))),
+            connection: Arc::new(ArcSwapOption::new(Some(Arc::new(connection)))),
             _actor_type: PhantomData,
         }
     }
@@ -123,7 +127,7 @@ where
             actor_id,
             location,
             transport,
-            connection: ArcSwapOption::empty(),
+            connection: Arc::new(ArcSwapOption::empty()),
             _actor_type: PhantomData,
         }
     }
@@ -643,5 +647,173 @@ where
         }
 
         Err(SendError::MissingConnection)
+    }
+}
+
+// Specialized implementation for KameoTransport with auto-retry on connection failure
+impl<'a, A, M> DistributedAskRequest<'a, A, M, Box<super::kameo_transport::KameoTransport>>
+where
+    A: Actor + Message<M>,
+    M: HasTypeHash
+        + Send
+        + 'static
+        + Archive
+        + for<'b> RSerialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'b>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >,
+    for<'b> <A as Message<M>>::Reply: Archive
+        + RSerialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'b>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >,
+    for<'b> <<A as Message<M>>::Reply as Archive>::Archived: RDeserialize<
+            <A as Message<M>>::Reply,
+            rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+        > + rkyv::bytecheck::CheckBytes<
+            rkyv::rancor::Strategy<
+                rkyv::validation::Validator<
+                    rkyv::validation::archive::ArchiveValidator<'b>,
+                    rkyv::validation::shared::SharedValidator,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >,
+{
+    /// Send with automatic connection refresh on failure and deserialize reply.
+    ///
+    /// # Idempotency Warning
+    ///
+    /// This method retries ONCE on connection failure. If your message handler
+    /// is NOT idempotent (e.g., creates resources, increments counters), use
+    /// `send()` instead and handle reconnection manually.
+    ///
+    /// Use `send_with_retry` only when:
+    /// - The handler is idempotent (same result if called twice)
+    /// - Or you can tolerate potential duplicate execution
+    ///
+    /// On connection error, this method will:
+    /// 1. Refresh the connection from the transport
+    /// 2. Retry the send once with the new connection
+    ///
+    /// This provides K8s resilience when pods restart with new IPs.
+    pub async fn send_with_retry(self) -> Result<<A as Message<M>>::Reply, SendError> {
+        let reply_bytes = self.send_raw_with_retry().await?;
+
+        // Deserialize the reply using rkyv - monomorphized for reply type R
+        let reply =
+            match rkyv::from_bytes::<<A as Message<M>>::Reply, rkyv::rancor::Error>(&reply_bytes) {
+                Ok(r) => r,
+                Err(_e) => {
+                    return Err(SendError::ActorStopped);
+                }
+            };
+
+        Ok(reply)
+    }
+
+    /// Send with automatic connection refresh on failure - returns raw bytes.
+    ///
+    /// Same idempotency warning as `send_with_retry`.
+    pub async fn send_raw_with_retry(self) -> Result<bytes::Bytes, SendError> {
+        // Pre-serialize the message once for potential retry
+        let type_hash = M::TYPE_HASH.as_u32();
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&self.message)
+            .map_err(|_e| SendError::ActorStopped)?;
+
+        // Default timeout if not specified
+        let default_timeout = Duration::from_secs(2);
+        let timeout = self.timeout.unwrap_or(default_timeout);
+
+        // First attempt with cached connection
+        if let Some(conn) = self.actor_ref.load_connection() {
+            match self.try_send_ask(&conn, type_hash, &payload, timeout).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) if Self::is_connection_error(&e) => {
+                    // Connection error - try to refresh and retry
+                    tracing::debug!("Connection error on ask, attempting refresh and retry");
+                    if let Ok(new_conn) = self.actor_ref.refresh_connection().await {
+                        return self.try_send_ask(&new_conn, type_hash, &payload, timeout).await;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // No connection - try to establish one
+        match self.actor_ref.refresh_connection().await {
+            Ok(conn) => self.try_send_ask(&conn, type_hash, &payload, timeout).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Internal helper to send pre-serialized ask payload
+    async fn try_send_ask(
+        &self,
+        conn: &ConnectionHandle,
+        type_hash: u32,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<bytes::Bytes, SendError> {
+        let threshold = conn.streaming_threshold();
+
+        // Use streaming for large messages
+        if payload.len() > threshold {
+            let streaming_timeout = {
+                let payload_mb = payload.len() as u64 / (1024 * 1024);
+                Duration::from_secs(30 + payload_mb)
+            };
+
+            let reply = conn
+                .ask_streaming_bytes(
+                    bytes::Bytes::copy_from_slice(payload),
+                    type_hash,
+                    self.actor_ref.actor_id.into_u64(),
+                    streaming_timeout,
+                )
+                .await
+                .map_err(|e| match e {
+                    GossipError::Timeout => SendError::Timeout(None),
+                    _ => SendError::ActorStopped,
+                })?;
+
+            return Ok(reply);
+        }
+
+        // Small message - use regular ask
+        let actor_message = RegistryMessage::ActorMessage {
+            actor_id: self.actor_ref.actor_id.into_u64().to_string(),
+            type_hash,
+            payload: payload.to_vec(),
+            correlation_id: None,
+        };
+
+        let serialized_msg = rkyv::to_bytes::<rkyv::rancor::Error>(&actor_message)
+            .map_err(|_e| SendError::ActorStopped)?;
+
+        let reply = match tokio::time::timeout(timeout, conn.ask(&serialized_msg)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => return Err(SendError::ActorStopped),
+            Err(_) => return Err(SendError::Timeout(None)),
+        };
+
+        Ok(reply)
+    }
+
+    /// Check if an error is connection-related and should trigger a refresh
+    fn is_connection_error(err: &SendError) -> bool {
+        matches!(err, SendError::ActorStopped | SendError::MissingConnection)
     }
 }
