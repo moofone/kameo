@@ -5,3 +5,7 @@
 Cargo.lock
 .direnv
 .envrc
+
+# Exceptions: architecture docs intentionally use .md (not .mdx).
+!docs/architecture/exactly_once_ask.md
+!docs/architecture/remote_messaging_type_erasure.md
