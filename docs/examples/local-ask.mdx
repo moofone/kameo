@@ -1,0 +1,31 @@
+# Local Ask
+
+A local `ask` returns a typed reply.
+
+```rust
+use kameo::{Actor, ActorRef};
+use kameo::message::{Context, Message};
+
+#[derive(Actor)]
+struct Adder {
+    sum: u64,
+}
+
+struct Add(pub u64);
+
+impl Message<Add> for Adder {
+    type Reply = u64;
+
+    async fn handle(&mut self, msg: Add, _ctx: &mut Context<Self, Self::Reply>) -> u64 {
+        self.sum += msg.0;
+        self.sum
+    }
+}
+
+# tokio_test::block_on(async {
+let adder: ActorRef<Adder> = <Adder as Actor>::spawn(Adder { sum: 0 });
+let v = adder.ask(Add(5)).send().await.unwrap();
+assert_eq!(v, 5);
+# });
+```
+

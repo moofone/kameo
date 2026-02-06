@@ -1,0 +1,86 @@
+# Remote Exactly-Once Ask (Session-Scoped)
+
+This is an opt-in, application-level facility for remote `ask` retries with receiver-side dedup.
+
+It is session-scoped:
+
+- Dedup state is in-memory.
+- It does not survive receiver process restarts.
+
+## Client
+
+- Generate a `RequestId` once per logical request.
+- Retry only on retryable errors (`ConnectionClosed`, `Timeout`).
+- Reuse the same `RequestId` for retries.
+
+```rust
+use std::time::Duration;
+
+use kameo::error::SendError;
+use kameo::remote::exactly_once::{ExactlyOnce, RequestId};
+
+# #[derive(kameo::RemoteMessage, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
+# struct DoWork { n: u64 }
+# async fn demo<A: kameo::actor::Actor>(mut remote: kameo::remote::DistributedActorRef<A>) {
+let id = RequestId::next();
+let msg = DoWork { n: 1 };
+
+let mut attempts = 0;
+loop {
+    attempts += 1;
+    let res = remote
+        .ask(ExactlyOnce { request_id: id, message: msg.clone() })
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await;
+
+    match res {
+        Ok(reply) => break,
+        Err(SendError::ConnectionClosed | SendError::Timeout(_)) if attempts < 5 => {
+            // Force a new socket to escape potential zombie connections.
+            if let Ok(Some(fresh)) = remote.refresh_force_new().await {
+                remote = fresh;
+            }
+            continue;
+        }
+        Err(_) => break,
+    }
+}
+# }
+```
+
+## Server
+
+Hold a dedup cache per actor instance and wrap the side effect inside `resolve_checked`.
+
+```rust
+use kameo::remote::exactly_once::{ExactlyOnce, ExactlyOnceDedup, PayloadFingerprint};
+use kameo::message::{Context, Message};
+
+# #[derive(kameo::Actor)]
+# struct Worker { dedup: ExactlyOnceDedup<u64> }
+# #[derive(kameo::RemoteMessage, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug)]
+# struct DoWork { n: u64 }
+
+impl Message<ExactlyOnce<DoWork>> for Worker {
+    type Reply = u64;
+
+    async fn handle(
+        &mut self,
+        msg: ExactlyOnce<DoWork>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> u64 {
+        let fp_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&msg.message).unwrap();
+        let fp = PayloadFingerprint::from_bytes(fp_bytes.as_ref());
+
+        self.dedup
+            .resolve_checked(msg.request_id, fp, || async {
+                // side effect here
+                msg.message.n
+            })
+            .await
+            .unwrap()
+    }
+}
+```
+

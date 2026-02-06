@@ -1,0 +1,32 @@
+# Remote Ask
+
+Remote `ask` is request/response over the transport.
+
+You still need `RemoteMessage` (type hash + rkyv) on the request type.
+
+```rust
+use kameo::RemoteMessage;
+use rkyv::{Archive, Deserialize, Serialize};
+
+#[derive(RemoteMessage, Archive, Serialize, Deserialize, Debug)]
+pub struct GetCount;
+```
+
+Sender side:
+
+```rust
+# use kameo::remote::DistributedActorRef;
+# use kameo::Actor;
+# async fn demo<A: Actor>(remote: DistributedActorRef<A>) {
+# #[derive(kameo::RemoteMessage, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug)]
+# struct GetCount;
+let reply = remote.ask(GetCount).send().await.unwrap();
+# let _ = reply;
+# }
+```
+
+Notes:
+
+- The reply type must be rkyv-serializable on the receiver and rkyv-deserializable on the sender.
+- If you want to bound zombie sockets, set `.timeout(...)` and retry.
+

@@ -1,0 +1,38 @@
+# Remote Links (Lifecycle, Signals, Socket Termination)
+
+Kameo supports linking to other actors so a local actor can react when the linked actor becomes
+available (link established) or becomes unavailable (link died).
+
+For distributed actors, link death is typically driven by TCP/TLS socket termination.
+
+## The Two Lifecycle Hooks
+
+Actors can implement:
+
+- `Actor::on_link_established(actor_ref, id)`
+- `Actor::on_link_died(actor_ref, id, reason)`
+
+These are delivered as mailbox signals (`Signal::LinkEstablished` and `Signal::LinkDied`).
+
+## What Counts As "Remote Link Died"
+
+With the `remote` feature, a peer socket disconnect triggers:
+
+- `on_link_died(..., reason = ActorStopReason::PeerDisconnected)`
+
+This is the main hook you use to:
+
+- stop dependent work
+- re-resolve a remote actor ref
+- reconnect and resume
+
+## Minimal Pattern: Link, Then React
+
+High-level flow:
+
+1. Do a remote `lookup()` to get a `DistributedActorRef`.
+2. Call `remote_ref.link(&local_actor_ref)`.
+3. Implement `on_link_established` and `on_link_died` on the local actor.
+
+See `docs/examples/remote-link-lifecycle.mdx`.
+

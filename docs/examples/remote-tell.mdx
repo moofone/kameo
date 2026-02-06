@@ -1,0 +1,32 @@
+# Remote Tell
+
+Remote messaging requires a compile-time type hash so the receiver can route raw bytes to the
+correct handler.
+
+Use `#[derive(RemoteMessage)]` on your message types.
+
+```rust
+use kameo::RemoteMessage;
+use rkyv::{Archive, Deserialize, Serialize};
+
+#[derive(RemoteMessage, Archive, Serialize, Deserialize, Debug)]
+pub struct Ping;
+```
+
+On the client, after you have a `DistributedActorRef<A>`, you can send a remote tell:
+
+```rust
+# use kameo::remote::DistributedActorRef;
+# use kameo::Actor;
+# async fn demo<A: Actor>(remote: DistributedActorRef<A>) {
+# #[derive(kameo::RemoteMessage, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug)]
+# struct Ping;
+remote.tell(Ping).send().await.unwrap();
+# }
+```
+
+Notes:
+
+- The message type hash is computed at compile time.
+- The transport serializes with rkyv.
+
