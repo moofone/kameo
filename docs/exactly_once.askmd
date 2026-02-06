@@ -1,0 +1,8 @@
+# Exactly-Once Ask (High-Level API Guide)
+
+This file is an alias of `docs/exactly_once.ask.md` (kept for naming compatibility).
+
+Primary docs:
+
+- `docs/exactly_once.ask.md`
+- `docs/EXACTLY_ONCE.md` (audit notes)
