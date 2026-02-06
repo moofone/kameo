@@ -50,6 +50,9 @@ impl kameo_remote::registry::PeerDisconnectHandler for RemoteLinkDisconnectHandl
         Box::pin(async move {
             let resolved = peer_id
                 .or_else(|| registry.connection_pool.get_peer_id_by_addr(&peer_addr));
+            // IMPORTANT: invalidate cached connection liveness BEFORE on_link_died fires.
+            // This makes stale DistributedActorRef clones fail fast on the next tell/ask.
+            super::handle_cache::invalidate(peer_addr, resolved.as_ref());
             if let Some(peer_id) = resolved.as_ref() {
                 super::remote_link::notify_peer_disconnected_by_id(peer_id).await;
                 return;

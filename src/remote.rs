@@ -49,6 +49,7 @@ pub mod dynamic_distributed_actor_ref;
 pub mod generic_type_hash;
 pub mod archived_access;
 pub(crate) mod location_metadata;
+pub(crate) mod handle_cache;
 pub mod exactly_once;
 mod kameo_transport;
 mod message_handler;

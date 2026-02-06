@@ -5,6 +5,8 @@
 //! Each message type gets its own specialized code path for maximum performance.
 
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -20,8 +22,7 @@ use crate::remote::remote_link;
 use kameo_remote::{GossipError, connection_pool::ConnectionHandle};
 
 use super::location_metadata;
-
-type LocationMetadataV1 = location_metadata::LocationMetadataV1;
+use super::handle_cache;
 
 /// A reference to a remote distributed actor
 ///
@@ -46,6 +47,9 @@ where
     pub(crate) transport: T,
     /// Cached connection handle for lock-free access (only for KameoTransport)
     pub(crate) connection: Option<ConnectionHandle>,
+    /// Liveness token for the cached connection. This is invalidated on peer socket disconnect
+    /// (before `on_link_died` fires) so stale clones fail fast without relying on eviction timing.
+    pub(crate) alive: Option<Arc<AtomicBool>>,
     /// The actor type, used for message type inference
     pub(crate) _actor_type: PhantomData<A>,
 }
@@ -62,6 +66,7 @@ where
             name: self.name.clone(),
             transport: self.transport.clone(),
             connection: self.connection.clone(),
+            alive: self.alive.clone(),
             _actor_type: PhantomData,
         }
     }
@@ -88,6 +93,7 @@ where
             name: None,
             transport,
             connection: Some(connection),
+            alive: None,
             _actor_type: PhantomData,
         }
     }
@@ -114,6 +120,7 @@ where
             name: None,
             transport,
             connection: None,
+            alive: None,
             _actor_type: PhantomData,
         }
     }
@@ -283,7 +290,7 @@ where
 }
 
 // Global transport cache for lookup without parameters
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 
 /// Global transport instance for distributed actor lookups
 ///
@@ -332,6 +339,10 @@ where
                 transport,
                 connection,
             );
+            let peer_id = location_metadata::decode_v1(&actor_ref.location.metadata)
+                .ok()
+                .map(|meta| meta.peer_id);
+            actor_ref.alive = Some(handle_cache::register(actor_ref.location.peer_addr, peer_id));
             actor_ref.name = Some(name.to_string());
             Ok(Some(actor_ref))
         } else {
@@ -385,7 +396,12 @@ where
         if connection.is_closed() {
             return Ok(None);
         }
-        let mut actor_ref = Self::new_with_connection(location.actor_id, location, transport, connection);
+        let mut actor_ref =
+            Self::new_with_connection(location.actor_id, location, transport, connection);
+        let peer_id = location_metadata::decode_v1(&actor_ref.location.metadata)
+            .ok()
+            .map(|meta| meta.peer_id);
+        actor_ref.alive = Some(handle_cache::register(actor_ref.location.peer_addr, peer_id));
         actor_ref.name = Some(name.to_string());
         Ok(Some(actor_ref))
     }
@@ -444,6 +460,12 @@ where
     /// code with compile-time constants and no dynamic dispatch. The type hash,
     /// serialization strategy, and all optimizations are resolved at compile time.
     pub async fn send(self) -> Result<(), SendError> {
+        if let Some(alive) = self.actor_ref.alive.as_ref() {
+            // Minimal overhead: a single relaxed atomic load.
+            if !alive.load(Ordering::Relaxed) {
+                return Err(SendError::ConnectionClosed);
+            }
+        }
         // Compile-time constant - no runtime lookup!
         let type_hash = M::TYPE_HASH.as_u32();
 
@@ -574,6 +596,12 @@ where
     ///
     /// This method is fully monomorphized and optimized for the specific message type M.
     pub async fn send_raw(self) -> Result<bytes::Bytes, SendError> {
+        if let Some(alive) = self.actor_ref.alive.as_ref() {
+            // Minimal overhead: a single relaxed atomic load.
+            if !alive.load(Ordering::Relaxed) {
+                return Err(SendError::ConnectionClosed);
+            }
+        }
         // Compile-time constant - no runtime lookup!
         let type_hash = M::TYPE_HASH.as_u32();
 
@@ -642,5 +670,55 @@ where
         }
 
         Err(SendError::MissingConnection)
+    }
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod tests {
+    use super::*;
+    use crate::remote::transport::{RemoteActorLocation, TransportConfig};
+
+    struct DummyActor;
+
+    impl Actor for DummyActor {
+        type Args = ();
+        type Error = ();
+
+        async fn on_start(_args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(Self)
+        }
+    }
+
+    #[derive(crate::RemoteMessage, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug)]
+    struct Noop;
+
+    #[tokio::test]
+    async fn cached_ref_fails_fast_after_handle_cache_invalidate() {
+        let peer_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let actor_id = ActorId::from_u64(0xC0FFEE);
+        let peer_id = kameo_remote::KeyPair::new_for_testing("liveness")
+            .peer_id();
+        let metadata = location_metadata::encode_v1(actor_id, peer_id.clone()).unwrap();
+        let location = RemoteActorLocation {
+            peer_addr,
+            actor_id,
+            metadata,
+        };
+
+        let transport = Box::new(super::super::kameo_transport::KameoTransport::new(
+            TransportConfig::default(),
+        ));
+        let mut actor_ref =
+            DistributedActorRef::<DummyActor, Box<super::super::kameo_transport::KameoTransport>>::__new_without_connection_for_tests(
+                actor_id,
+                location,
+                transport,
+            );
+
+        actor_ref.alive = Some(handle_cache::register(peer_addr, Some(peer_id.clone())));
+        handle_cache::invalidate(peer_addr, Some(&peer_id));
+
+        let res = actor_ref.tell(Noop).send().await;
+        assert!(matches!(res, Err(SendError::ConnectionClosed)));
     }
 }

@@ -6,6 +6,13 @@
 #![deny(unused_must_use)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+// Procedural derives in `kameo_macros` reference this crate as `::kameo::...`.
+// When those derives are used inside this crate (unit tests, internal helpers),
+// we need an explicit self-alias to satisfy that path.
+#[cfg(any(test, feature = "macros"))]
+#[allow(unused_extern_crates)]
+extern crate self as kameo;
+
 pub mod actor;
 pub mod error;
 pub mod mailbox;

@@ -30,7 +30,8 @@ fn invalidate_key(map: &mut HashMap<CacheKey, Vec<Weak<AtomicBool>>>, key: Cache
     };
     entry.retain(|weak| {
         if let Some(alive) = weak.upgrade() {
-            alive.store(false, Ordering::Release);
+            // This flag is only a local fast-fail latch; it does not publish/guard any other data.
+            alive.store(false, Ordering::Relaxed);
             true
         } else {
             false
