@@ -7,6 +7,7 @@ kameo = { path = ".", version = "0.19.2" }
 
 futures = "0.3"
 tokio = "1.47"
+kameo_remote = { git = "https://github.com/moofone/kameo_remote", branch = "main" }
 
 [profile.dev]
 # Optimize dependencies in dev mode for better performance
@@ -67,7 +68,7 @@ downcast-rs = "2.0.1"
 dyn-clone = "1.0"
 futures.workspace = true
 hex = "0.4"
-kameo_remote = { path = "../kameo_remote", optional = true }
+kameo_remote = { workspace = true, optional = true }
 metrics = { version = "0.24.2", optional = true }
 rkyv = { version = "0.8", features = ["bytecheck", "std"], optional = true }
 thiserror = "2.0"

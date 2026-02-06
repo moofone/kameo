@@ -9,7 +9,7 @@ static TRUSTED_ARCHIVED: AtomicBool = AtomicBool::new(false);
 ///
 /// Trusted mode only takes effect when the `trusted-archived` feature is enabled.
 pub fn set_trusted_archived(enabled: bool) {
-    TRUSTED_ARCHIVED.store(enabled, Ordering::SeqCst);
+    TRUSTED_ARCHIVED.store(enabled, Ordering::Relaxed);
 }
 
 /// Returns true when trusted archived access is enabled and supported.

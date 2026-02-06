@@ -1,15 +1,21 @@
+#[cfg(feature = "remote")]
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+#[cfg(feature = "remote")]
 use kameo::remote::archived_access::{
     access_archived, set_trusted_archived, trusted_archived_supported,
 };
+#[cfg(feature = "remote")]
 use rkyv::{Archive, Deserialize, Serialize};
+#[cfg(feature = "remote")]
 use rkyv::util::AlignedVec;
 
+#[cfg(feature = "remote")]
 #[derive(Archive, Serialize, Deserialize)]
 struct BenchPayload {
     data: [u8; 256],
 }
 
+#[cfg(feature = "remote")]
 fn make_payload() -> kameo_remote::AlignedBytes {
     let value = BenchPayload { data: [42u8; 256] };
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&value).expect("serialize payload");
@@ -18,6 +24,7 @@ fn make_payload() -> kameo_remote::AlignedBytes {
     kameo_remote::AlignedBytes::from_aligned_vec(aligned)
 }
 
+#[cfg(feature = "remote")]
 fn bench_archived_access(c: &mut Criterion) {
     let payload = make_payload();
     let mut latency = c.benchmark_group("remote_archived_access_latency");
@@ -77,5 +84,10 @@ fn bench_archived_access(c: &mut Criterion) {
     throughput.finish();
 }
 
+#[cfg(feature = "remote")]
 criterion_group!(benches, bench_archived_access);
+#[cfg(feature = "remote")]
 criterion_main!(benches);
+
+#[cfg(not(feature = "remote"))]
+fn main() {}

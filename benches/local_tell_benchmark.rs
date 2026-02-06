@@ -1,5 +1,6 @@
-use kameo::actor::ActorRef;
-use kameo::request::Tell;
+use kameo::actor::{ActorRef, Spawn};
+use kameo::error::Infallible;
+use kameo::message::{Context, Message};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -15,13 +16,13 @@ unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        System.alloc(layout)
+        unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         DEALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        System.dealloc(ptr, layout)
+        unsafe { System.dealloc(ptr, layout) }
     }
 }
 
@@ -33,25 +34,23 @@ struct EchoMessage {
     payload: Vec<u8>,
 }
 
-impl Tell for EchoMessage {}
-
 struct EchoActor;
 
-impl kameo::actor::Actor for EchoActor {
-    type Msg = EchoMessage;
+impl Message<EchoMessage> for EchoActor {
+    type Reply = ();
 
-    async fn pre_start(&mut self, _ctx: kameo::context::Context<Self::Msg>) -> Result<(), kameo::error::BoxError> {
-        Ok(())
-    }
-
-    async fn handle(
-        &mut self,
-        msg: Self::Msg,
-        _ctx: kameo::context::Context<Self::Msg>,
-    ) -> Result<(), kameo::error::BoxError> {
+    async fn handle(&mut self, msg: EchoMessage, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         // Simulate minimal work - just read the payload
         let _ = msg.payload.len();
-        Ok(())
+    }
+}
+
+impl kameo::Actor for EchoActor {
+    type Args = ();
+    type Error = Infallible;
+
+    async fn on_start(_args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        Ok(Self)
     }
 }
 
@@ -79,10 +78,7 @@ fn main() {
 
     rt.block_on(async {
         // Spawn the actor
-        let actor_ref: ActorRef<EchoActor> =
-            kameo::actor::Actor::spawn(None, EchoActor, ())
-                .await
-                .expect("Failed to spawn actor");
+        let actor_ref: ActorRef<EchoActor> = <EchoActor as Spawn>::spawn(());
 
         println!("✅ Actor spawned: {:?}", actor_ref.id());
         println!("Warming up...\n");
@@ -129,7 +125,7 @@ fn main() {
         print_alloc_delta("local tell()", before, after);
 
         // Cleanup
-        let _ = actor_ref.stop().await;
+        let _ = actor_ref.stop_gracefully().await;
         println!("\n✅ Benchmark complete");
     });
 }

@@ -57,6 +57,9 @@ impl kameo_remote::registry::PeerDisconnectHandler for RemoteLinkDisconnectHandl
                 super::remote_link::notify_peer_disconnected_by_id(peer_id).await;
                 return;
             }
+            // Fallback: if the transport couldn't resolve PeerId (race / legacy), still dispatch
+            // link death by address so addr-only links aren't leaked.
+            super::remote_link::notify_peer_disconnected_by_addr(peer_addr).await;
             tracing::warn!(
                 peer_addr = %peer_addr,
                 "peer disconnect without peer_id; remote link notifications skipped"
